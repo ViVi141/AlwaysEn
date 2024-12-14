@@ -15,10 +15,15 @@ class InputMethodManager:
 
     def get_current_keyboard_layout(self, hwnd):
         """获取指定窗口句柄的当前输入法布局"""
-        pid = ctypes.c_ulong()  # 用于存储进程ID
-        tid = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        layout_id = ctypes.windll.user32.GetKeyboardLayout(tid)
-        return f"{layout_id & 0xFFFF:04X}"  # 返回低16位，确保是0304格式
+        try:
+            pid = ctypes.c_ulong()  # 用于存储进程ID
+            tid = ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            layout_id = ctypes.windll.user32.GetKeyboardLayout(tid)
+            return f"{layout_id & 0xFFFF:04X}"  # 返回低16位，确保是0409格式
+        except Exception as e:
+            print(f"获取输入法布局失败: {e}")
+            messagebox.showerror("错误", f"获取输入法布局失败: {e}")
+            return None
 
     def switch_to_english(self):
         """通过模拟键盘快捷键切换到英文输入法"""
@@ -28,7 +33,7 @@ class InputMethodManager:
             time.sleep(1)  # 等待输入法切换生效
         except Exception as e:
             print(f"输入法切换失败: {e}")
-            messagebox.showerror("错误", "输入法切换失败，请检查系统设置。")
+            messagebox.showerror("错误", f"输入法切换失败: {e}")
 
 class InputSwitcherApp:
     """输入法切换器应用程序类"""
@@ -77,9 +82,14 @@ class InputSwitcherApp:
         selected_index = self.window_listbox.curselection()
         if selected_index:
             window_title = self.window_listbox.get(selected_index)
-            self.target_window = gw.getWindowsWithTitle(window_title)[0]  # 获取窗口对象
-            self.target_pid = self.get_pid_by_handle(self.target_window._hWnd)
-            self.selected_window_label.config(text=f"已选择窗口: {self.target_window.title}")
+            try:
+                self.target_window = gw.getWindowsWithTitle(window_title)[0]  # 获取窗口对象
+                self.target_pid = self.get_pid_by_handle(self.target_window._hWnd)
+                self.selected_window_label.config(text=f"已选择窗口: {self.target_window.title}")
+            except IndexError:
+                messagebox.showwarning("警告", "选择的窗口不存在，请刷新窗口列表后重新选择。")
+            except Exception as e:
+                messagebox.showerror("错误", f"选择窗口失败: {e}")
         else:
             messagebox.showwarning("警告", "未选择有效窗口")
 
@@ -88,8 +98,13 @@ class InputSwitcherApp:
         self.status_label.config(text=f"监控中: PID {self.target_pid}")
         self.is_running = True
         while self.is_running:
-            self._check_input_method()
-            time.sleep(0.1)  # 每0.1秒检查一次，更频繁地响应改变
+            try:
+                self._check_input_method()
+            except Exception as e:
+                print(f"监控过程中发生错误: {e}")
+                messagebox.showerror("错误", f"监控过程中发生错误: {e}")
+            finally:
+                time.sleep(0.1)  # 每0.1秒检查一次，更频繁地响应改变
 
     def _check_input_method(self):
         """检查当前输入法，并进行切换"""
@@ -97,6 +112,8 @@ class InputSwitcherApp:
             active_window = gw.getActiveWindow()
             if active_window and self.target_pid == self.get_pid_by_handle(active_window._hWnd):
                 current_lang_tag = self.input_method_manager.get_current_keyboard_layout(self.target_window._hWnd)
+                if current_lang_tag is None:
+                    return
                 print(f"当前输入法语言标签: {current_lang_tag}")  # 输出当前语言标签
 
                 with self.lock:  # 防止竞争条件
@@ -105,8 +122,6 @@ class InputSwitcherApp:
                         if not self.input_method_manager.lang_id_is_english:
                             self.input_method_manager.lang_id_is_english = True
                             print("检测到输入法切换为英文")
-                        else:
-                            print("当前已为英文输入法，无需切换。")
                     else:  # 非英文输入法
                         if self.input_method_manager.lang_id_is_english:
                             self.input_method_manager.lang_id_is_english = False
@@ -122,19 +137,28 @@ class InputSwitcherApp:
             self.is_running = True
             self.status_label.config(text=f"正在启动监控... (PID: {self.target_pid})")
             threading.Thread(target=self.monitor_window, daemon=True).start()
+        else:
+            messagebox.showwarning("警告", "请先选择一个窗口并开始监控。")
 
     def stop_monitoring(self):
         """停止监控"""
         if self.is_running:
             self.is_running = False
             self.status_label.config(text="监控已停止")
+        else:
+            messagebox.showwarning("警告", "当前没有正在监控的窗口。")
 
     @staticmethod
     def get_pid_by_handle(hwnd):
         """获取窗口句柄对应的进程ID"""
-        pid = ctypes.c_ulong()
-        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        return pid.value
+        try:
+            pid = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return pid.value
+        except Exception as e:
+            print(f"获取进程ID失败: {e}")
+            messagebox.showerror("错误", f"获取进程ID失败: {e}")
+            return None
 
 if __name__ == "__main__":
     """主程序入口"""
