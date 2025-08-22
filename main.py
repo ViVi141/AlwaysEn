@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import messagebox
+import psutil
 import pygetwindow as gw
 import time
 import threading
@@ -13,8 +14,8 @@ except Exception:
     HKLType = ctypes.c_void_p
 
 # 版本信息
-APP_VERSION = "2.0"
-APP_BUILD_DATE = "2025-08-19"
+APP_VERSION = "2.1"
+APP_BUILD_DATE = "2025-08-22"
 
 class InputMethodManager:
     """输入法管理类"""
@@ -103,7 +104,7 @@ class InputSwitcherApp:
         self.master = master
         self.master.title(f"强制保持英文输入法 v{APP_VERSION}")
         try:
-            self.master.minsize(560, 420)
+            self.master.minsize(600, 480)
         except Exception:
             pass
 
@@ -111,10 +112,14 @@ class InputSwitcherApp:
         self.target_pid = None
         self.target_window = None
         self.target_root_hwnd = None
+        self.target_process_name = None
+        self.target_process_path = None
+        self.monitor_mode = "window"  # "window"、"process" 或 "path"
         self.is_running = False
         self.lock = threading.Lock()  # 线程锁
         self.last_lang_tag = ""
         self.window_items = []
+        self.process_items = []
         self.var_topmost = tk.BooleanVar(value=False)
         self.var_debug = tk.BooleanVar(value=False)
         self._last_debug_log_times = {}
@@ -122,19 +127,34 @@ class InputSwitcherApp:
 
         self._init_ui()
         self.populate_window_list()
+        self.populate_process_list()
+        self.switch_monitor_mode()  # 初始化UI状态
 
     def _init_ui(self):
         """初始化用户界面控件"""
-        selection_group = tk.LabelFrame(self.master, text="窗口选择", padx=8, pady=8)
-        selection_group.pack(fill="both", expand=True, padx=10, pady=10)
+        # 监控模式选择
+        mode_frame = tk.Frame(self.master)
+        mode_frame.pack(fill="x", padx=10, pady=(10, 5))
+        tk.Label(mode_frame, text="监控模式:").pack(side="left")
+        self.var_monitor_mode = tk.StringVar(value="window")
+        tk.Radiobutton(mode_frame, text="窗口监控", variable=self.var_monitor_mode, value="window", 
+                      command=self.switch_monitor_mode).pack(side="left", padx=(10, 5))
+        tk.Radiobutton(mode_frame, text="程序监控", variable=self.var_monitor_mode, value="process", 
+                      command=self.switch_monitor_mode).pack(side="left", padx=5)
+        tk.Radiobutton(mode_frame, text="路径监控", variable=self.var_monitor_mode, value="path", 
+                      command=self.switch_monitor_mode).pack(side="left", padx=5)
 
-        self.selected_window_label = tk.Label(selection_group, text="未选择窗口")
+        # 窗口选择组
+        self.window_group = tk.LabelFrame(self.master, text="窗口选择", padx=8, pady=8)
+        self.window_group.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.selected_window_label = tk.Label(self.window_group, text="未选择窗口")
         self.selected_window_label.pack(anchor="w", pady=(0, 6))
 
-        list_frame = tk.Frame(selection_group)
+        list_frame = tk.Frame(self.window_group)
         list_frame.pack(fill="both", expand=True)
 
-        self.window_listbox = tk.Listbox(list_frame, width=60, height=12)
+        self.window_listbox = tk.Listbox(list_frame, width=60, height=8)
         self.window_listbox.pack(side="left", fill="both", expand=True)
         scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=self.window_listbox.yview)
         scrollbar.pack(side="right", fill="y")
@@ -142,14 +162,55 @@ class InputSwitcherApp:
         self.window_listbox.bind("<Double-1>", lambda e: self.select_window())
         self.window_listbox.bind("<Return>", lambda e: self.select_window())
 
+        # 程序选择组
+        self.process_group = tk.LabelFrame(self.master, text="程序选择", padx=8, pady=8)
+        self.process_group.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.selected_process_label = tk.Label(self.process_group, text="未选择程序")
+        self.selected_process_label.pack(anchor="w", pady=(0, 6))
+
+        process_list_frame = tk.Frame(self.process_group)
+        process_list_frame.pack(fill="both", expand=True)
+
+        self.process_listbox = tk.Listbox(process_list_frame, width=60, height=8)
+        self.process_listbox.pack(side="left", fill="both", expand=True)
+        process_scrollbar = tk.Scrollbar(process_list_frame, orient="vertical", command=self.process_listbox.yview)
+        process_scrollbar.pack(side="right", fill="y")
+        self.process_listbox.config(yscrollcommand=process_scrollbar.set)
+        self.process_listbox.bind("<Double-1>", lambda e: self.select_process())
+        self.process_listbox.bind("<Return>", lambda e: self.select_process())
+
+        # 路径监控组
+        self.path_group = tk.LabelFrame(self.master, text="路径监控", padx=8, pady=8)
+        self.path_group.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.selected_path_label = tk.Label(self.path_group, text="未选择程序路径")
+        self.selected_path_label.pack(anchor="w", pady=(0, 6))
+
+        path_input_frame = tk.Frame(self.path_group)
+        path_input_frame.pack(fill="x", pady=(0, 6))
+        
+        tk.Label(path_input_frame, text="程序路径:").pack(side="left")
+        self.path_entry = tk.Entry(path_input_frame, width=50)
+        self.path_entry.pack(side="left", fill="x", expand=True, padx=(5, 5))
+        tk.Button(path_input_frame, text="浏览", command=self.browse_path, width=8).pack(side="right")
+
+        # 路径验证和状态显示
+        self.path_status_label = tk.Label(self.path_group, text="", fg="gray")
+        self.path_status_label.pack(anchor="w", pady=(0, 6))
+
+        # 按钮框架
         btn_frame = tk.Frame(self.master)
         btn_frame.pack(fill="x", padx=10, pady=(0, 8))
         tk.Button(btn_frame, text="选择窗口", command=self.select_window, width=12).pack(side="left", padx=4)
+        tk.Button(btn_frame, text="选择程序", command=self.select_process, width=12).pack(side="left", padx=4)
+        tk.Button(btn_frame, text="验证路径", command=self.validate_path, width=12).pack(side="left", padx=4)
         self.btn_start = tk.Button(btn_frame, text="开始监控", command=self.start_monitoring, width=12, state="disabled")
+        self.btn_start.config(state="disabled")
         self.btn_start.pack(side="left", padx=4)
         self.btn_stop = tk.Button(btn_frame, text="取消监控", command=self.stop_monitoring, width=12, state="disabled")
         self.btn_stop.pack(side="left", padx=4)
-        tk.Button(btn_frame, text="刷新窗口列表", command=self.populate_window_list, width=14).pack(side="left", padx=4)
+        tk.Button(btn_frame, text="刷新列表", command=self.refresh_lists, width=12).pack(side="left", padx=4)
         tk.Checkbutton(btn_frame, text="窗口置顶", variable=self.var_topmost, command=self.toggle_topmost).pack(side="right", padx=4)
         tk.Checkbutton(btn_frame, text="调试日志", variable=self.var_debug).pack(side="right", padx=4)
 
@@ -202,6 +263,241 @@ class InputSwitcherApp:
                 self._last_debug_log_times[key] = now
         except Exception:
             pass
+
+    def switch_monitor_mode(self):
+        """切换监控模式"""
+        self.monitor_mode = self.var_monitor_mode.get()
+        
+        # 隐藏所有组
+        self.window_group.pack_forget()
+        self.process_group.pack_forget()
+        self.path_group.pack_forget()
+        
+        if self.monitor_mode == "window":
+            self.window_group.pack(fill="both", expand=True, padx=10, pady=5)
+            self.selected_window_label.config(text="未选择窗口")
+            self.selected_process_label.config(text="未选择程序")
+            self.selected_path_label.config(text="未选择程序路径")
+        elif self.monitor_mode == "process":
+            self.process_group.pack(fill="both", expand=True, padx=10, pady=5)
+            self.selected_window_label.config(text="未选择窗口")
+            self.selected_process_label.config(text="未选择程序")
+            self.selected_path_label.config(text="未选择程序路径")
+        else:  # path mode
+            self.path_group.pack(fill="both", expand=True, padx=10, pady=5)
+            self.selected_window_label.config(text="未选择窗口")
+            self.selected_process_label.config(text="未选择程序")
+            self.selected_path_label.config(text="未选择程序路径")
+        
+        # 重置选择状态
+        self.target_pid = None
+        self.target_window = None
+        self.target_root_hwnd = None
+        self.target_process_name = None
+        self.target_process_path = None
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="disabled")
+        self.is_running = False
+        self.update_status("就绪")
+
+    def populate_process_list(self):
+        """获取并显示所有进程"""
+        try:
+            import psutil
+            processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                try:
+                    info = proc.info
+                    if info['name'] and info['exe']:
+                        display = f"{info['name']} (PID {info['pid']})"
+                        processes.append((display, info['pid'], info['name']))
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            
+            # 按名称排序
+            processes.sort(key=lambda x: x[2].lower())
+            
+            self.process_items = processes
+            self.process_listbox.delete(0, tk.END)
+            for display, _, _ in processes:
+                self.process_listbox.insert(tk.END, display)
+        except ImportError:
+            # 如果没有psutil，使用Windows API获取进程列表
+            self.populate_process_list_winapi()
+        except Exception as e:
+            messagebox.showerror("错误", f"获取进程列表失败: {e}")
+
+    def populate_process_list_winapi(self):
+        """使用Windows API获取进程列表（备用方案）"""
+        try:
+            import win32process
+            import win32gui
+            import win32con
+            
+            processes = []
+            def enum_windows_callback(hwnd, processes):
+                try:
+                    if win32gui.IsWindowVisible(hwnd):
+                        title = win32gui.GetWindowText(hwnd)
+                        if title and title.strip():
+                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                            try:
+                                proc = psutil.Process(pid)
+                                name = proc.name()
+                                display = f"{name} (PID {pid})"
+                                processes.append((display, pid, name))
+                            except:
+                                display = f"Unknown (PID {pid})"
+                                processes.append((display, pid, "Unknown"))
+                    return True
+                except:
+                    return True
+            
+            win32gui.EnumWindows(enum_windows_callback, processes)
+            
+            # 去重并按名称排序
+            seen = set()
+            unique_processes = []
+            for display, pid, name in processes:
+                if (pid, name) not in seen:
+                    seen.add((pid, name))
+                    unique_processes.append((display, pid, name))
+            
+            unique_processes.sort(key=lambda x: x[2].lower())
+            self.process_items = unique_processes
+            self.process_listbox.delete(0, tk.END)
+            for display, _, _ in unique_processes:
+                self.process_listbox.insert(tk.END, display)
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"获取进程列表失败: {e}")
+
+    def select_process(self):
+        """选择要监控的程序"""
+        selected_index = self.process_listbox.curselection()
+        if not selected_index:
+            messagebox.showwarning("警告", "未选择有效程序")
+            return
+        idx = selected_index[0]
+        try:
+            display, pid, name = self.process_items[idx]
+            self.target_pid = pid
+            self.target_process_name = name
+            self.target_window = None
+            self.target_root_hwnd = None
+            self.selected_process_label.config(text=f"已选择程序: {name} (PID {pid})")
+            self.btn_start.config(state="normal")
+        except Exception as e:
+            messagebox.showerror("错误", f"选择程序失败: {e}")
+
+    def refresh_lists(self):
+        """刷新窗口和进程列表"""
+        if self.monitor_mode == "window":
+            self.populate_window_list()
+        elif self.monitor_mode == "process":
+            self.populate_process_list()
+        # 路径监控模式不需要刷新列表
+
+    def browse_path(self):
+        """浏览选择程序路径"""
+        from tkinter import filedialog
+        file_path = filedialog.askopenfilename(
+            title="选择要监控的程序",
+            filetypes=[
+                ("可执行文件", "*.exe"),
+                ("所有文件", "*.*")
+            ]
+        )
+        if file_path:
+            self.path_entry.delete(0, tk.END)
+            self.path_entry.insert(0, file_path)
+            self.validate_path()
+
+    def validate_path(self):
+        """验证程序路径"""
+        path = self.path_entry.get().strip()
+        if not path:
+            self.path_status_label.config(text="请输入程序路径", fg="red")
+            self.btn_start.config(state="disabled")
+            return False
+        
+        import os
+        if not os.path.exists(path):
+            self.path_status_label.config(text="文件不存在", fg="red")
+            self.btn_start.config(state="disabled")
+            return False
+        
+        if not os.path.isfile(path):
+            self.path_status_label.config(text="不是有效的文件", fg="red")
+            self.btn_start.config(state="disabled")
+            return False
+        
+        # 获取文件名（不含扩展名）
+        filename = os.path.splitext(os.path.basename(path))[0]
+        self.target_process_path = path
+        self.target_process_name = filename
+        
+        self.path_status_label.config(text=f"✓ 路径有效: {filename}", fg="green")
+        self.selected_path_label.config(text=f"已选择程序: {filename}")
+        self.btn_start.config(state="normal")
+        return True
+
+    def _is_window_belongs_to_path(self, hwnd):
+        """检查窗口是否属于指定路径的程序"""
+        try:
+            if not hwnd or not self.target_process_path:
+                return False
+            
+            # 获取窗口对应的进程ID
+            pid = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            
+            if pid.value == 0:
+                return False
+            
+            # 通过进程ID获取进程路径
+            import psutil
+            try:
+                proc = psutil.Process(pid.value)
+                proc_exe = proc.exe()
+                
+                # 比较路径（忽略大小写，处理路径分隔符）
+                import os
+                target_path = os.path.normpath(self.target_process_path.lower())
+                proc_path = os.path.normpath(proc_exe.lower())
+                
+                return target_path == proc_path
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                return False
+                
+        except Exception as e:
+            self._debug_log("path_check_error", f"路径检查失败: {e}")
+            return False
+
+    def _is_window_belongs_to_process(self, hwnd, target_pid):
+        """检查窗口是否属于指定进程"""
+        try:
+            if not hwnd:
+                return False
+            pid = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return pid.value == target_pid
+        except Exception:
+            return False
+
+    def _get_window_title(self, hwnd):
+        """获取窗口标题"""
+        try:
+            if not hwnd:
+                return "Unknown"
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if length == 0:
+                return "Untitled"
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buffer, length + 1)
+            return buffer.value or "Untitled"
+        except Exception:
+            return "Unknown"
 
     def populate_window_list(self):
         """获取并显示所有窗口"""
@@ -256,8 +552,14 @@ class InputSwitcherApp:
             messagebox.showerror("错误", f"选择窗口失败: {e}")
 
     def monitor_window(self):
-        """监控选定窗口的输入法状态"""
-        self.update_status(f"监控中: PID {self.target_pid}")
+        """监控选定窗口、程序或路径的输入法状态"""
+        if self.monitor_mode == "window":
+            self.update_status(f"监控中: 窗口 PID {self.target_pid}")
+        elif self.monitor_mode == "process":
+            self.update_status(f"监控中: 程序 {self.target_process_name} (PID {self.target_pid})")
+        else:  # path mode
+            self.update_status(f"监控中: 程序路径 {self.target_process_name}")
+        
         self.is_running = True
         while self.is_running:
             try:
@@ -267,14 +569,33 @@ class InputSwitcherApp:
                     user32 = ctypes.windll.user32
                     fg_hwnd = int(user32.GetForegroundWindow() or 0)
                     fg_root = self._get_root_hwnd(fg_hwnd) if fg_hwnd else None
-                    is_active_target = (fg_root is not None and self.target_root_hwnd is not None and fg_root == self.target_root_hwnd)
+                    
+                    if self.monitor_mode == "window":
+                        is_active_target = (fg_root is not None and self.target_root_hwnd is not None and fg_root == self.target_root_hwnd)
+                    elif self.monitor_mode == "process":
+                        # 程序监控模式：检查前台窗口是否属于目标程序
+                        is_active_target = self._is_window_belongs_to_process(fg_hwnd, self.target_pid)
+                    else:  # path mode
+                        # 路径监控模式：检查前台窗口是否属于指定路径的程序
+                        is_active_target = self._is_window_belongs_to_path(fg_hwnd)
+                        
                 except Exception:
                     is_active_target = False
 
                 if is_active_target:
-                    status = f"监控中: PID {self.target_pid} | HKL: {self.last_lang_tag or '----'} | 窗口: {self.target_window.title}"
+                    if self.monitor_mode == "window":
+                        status = f"监控中: 窗口 PID {self.target_pid} | HKL: {self.last_lang_tag or '----'} | 窗口: {self.target_window.title}"
+                    elif self.monitor_mode == "process":
+                        status = f"监控中: 程序 {self.target_process_name} | HKL: {self.last_lang_tag or '----'} | 当前窗口: {self._get_window_title(fg_hwnd)}"
+                    else:  # path mode
+                        status = f"监控中: 程序 {self.target_process_name} | HKL: {self.last_lang_tag or '----'} | 当前窗口: {self._get_window_title(fg_hwnd)}"
                 else:
-                    status = f"等待目标窗口激活 | 目标: {self.target_window.title}"
+                    if self.monitor_mode == "window":
+                        status = f"等待目标窗口激活 | 目标: {self.target_window.title}"
+                    elif self.monitor_mode == "process":
+                        status = f"等待程序 {self.target_process_name} 的窗口激活"
+                    else:  # path mode
+                        status = f"等待程序 {self.target_process_name} 启动并激活"
                 self.update_status(status)
             except Exception as e:
                 print(f"监控过程中发生错误: {e}")
@@ -284,65 +605,101 @@ class InputSwitcherApp:
 
     def _check_input_method(self):
         """检查当前输入法，并进行切换"""
-        if self.target_window:
-            user32 = ctypes.windll.user32
-            fg_hwnd = int(user32.GetForegroundWindow() or 0)
-            if fg_hwnd:
+        user32 = ctypes.windll.user32
+        fg_hwnd = int(user32.GetForegroundWindow() or 0)
+        
+        if not fg_hwnd:
+            return
+            
+        # 根据监控模式判断是否需要处理
+        should_process = False
+        
+        if self.monitor_mode == "window":
+            # 窗口监控模式：检查是否为选定的窗口
+            if self.target_window and self.target_root_hwnd:
                 fg_root = self._get_root_hwnd(fg_hwnd)
-            else:
-                fg_root = None
-            if fg_root is not None and self.target_root_hwnd is not None and fg_root == self.target_root_hwnd:
-                # 针对当前前台窗口线程读取 HKL（更符合焦点线程的输入法状态）
-                current_lang_tag = self.input_method_manager.get_current_keyboard_layout(fg_hwnd)
-                if current_lang_tag is None:
-                    return
-                self._debug_log("hkl", f"当前输入法语言标签: {current_lang_tag}")
-                self.last_lang_tag = current_lang_tag
+                should_process = (fg_root is not None and fg_root == self.target_root_hwnd)
+        elif self.monitor_mode == "process":
+            # 程序监控模式：检查前台窗口是否属于目标程序
+            should_process = self._is_window_belongs_to_process(fg_hwnd, self.target_pid)
+        else:  # path mode
+            # 路径监控模式：检查前台窗口是否属于指定路径的程序
+            should_process = self._is_window_belongs_to_path(fg_hwnd)
+        
+        if should_process:
+            # 针对当前前台窗口线程读取 HKL（更符合焦点线程的输入法状态）
+            current_lang_tag = self.input_method_manager.get_current_keyboard_layout(fg_hwnd)
+            if current_lang_tag is None:
+                return
+            self._debug_log("hkl", f"当前输入法语言标签: {current_lang_tag}")
+            self.last_lang_tag = current_lang_tag
 
-                with self.lock:  # 防止竞争条件
-                    # 将字符串（如"0409"）解析为整数 LANGID 并判断是否英语（支持英美/英英等）
+            with self.lock:  # 防止竞争条件
+                # 将字符串（如"0409"）解析为整数 LANGID 并判断是否英语（支持英美/英英等）
+                try:
+                    langid_value = int(current_lang_tag, 16)
+                except ValueError:
+                    langid_value = 0
+
+                is_english = self.input_method_manager.is_english_langid(langid_value)
+                if is_english:
+                    if not self.input_method_manager.lang_id_is_english:
+                        self.input_method_manager.lang_id_is_english = True
+                        print("检测到输入法切换为英文")
                     try:
-                        langid_value = int(current_lang_tag, 16)
-                    except ValueError:
-                        langid_value = 0
-
-                    is_english = self.input_method_manager.is_english_langid(langid_value)
-                    if is_english:
-                        if not self.input_method_manager.lang_id_is_english:
-                            self.input_method_manager.lang_id_is_english = True
-                            print("检测到输入法切换为英文")
-                        try:
-                            self.set_status_style_by_lang(True)
-                        except Exception:
-                            pass
-                    else:
-                        if self.input_method_manager.lang_id_is_english:
-                            self.input_method_manager.lang_id_is_english = False
-                            print("检测到输入法切换为非英文，准备切换为英文")
-                        # 切换为英文输入法（更底层针对当前前台窗口）
-                        try:
-                            self.input_method_manager.force_english_for_hwnd(fg_hwnd)
-                        except Exception as e:
-                            print(f"force_english_for_hwnd 失败: {e}")
-                        try:
-                            self.set_status_style_by_lang(False)
-                        except Exception:
-                            pass
-            else:
+                        self.set_status_style_by_lang(True)
+                    except Exception:
+                        pass
+                else:
+                    if self.input_method_manager.lang_id_is_english:
+                        self.input_method_manager.lang_id_is_english = False
+                        print("检测到输入法切换为非英文，准备切换为英文")
+                    # 切换为英文输入法（更底层针对当前前台窗口）
+                    try:
+                        self.input_method_manager.force_english_for_hwnd(fg_hwnd)
+                    except Exception as e:
+                        print(f"force_english_for_hwnd 失败: {e}")
+                    try:
+                        self.set_status_style_by_lang(False)
+                    except Exception:
+                        pass
+        else:
+            if self.monitor_mode == "window":
                 self._debug_log("skip_non_target", "当前前台窗口不属于所选顶层窗口，跳过检测。")
+            elif self.monitor_mode == "process":
+                self._debug_log("skip_non_target", "当前前台窗口不属于目标程序，跳过检测。")
+            else:  # path mode
+                self._debug_log("skip_non_target", "当前前台窗口不属于指定路径的程序，跳过检测。")
 
     def start_monitoring(self):
-        """开始监控选中的窗口"""
-        if self.target_pid is not None and not self.is_running:
-            self.is_running = True
-            self.status_label.config(text=f"正在启动监控... (PID: {self.target_pid})")
+        """开始监控选中的窗口、程序或路径"""
+        if not self.is_running:
+            # 检查是否有有效的监控目标
+            if self.monitor_mode == "window" and self.target_pid is not None:
+                self.is_running = True
+                self.status_label.config(text=f"正在启动窗口监控... (PID: {self.target_pid})")
+            elif self.monitor_mode == "process" and self.target_pid is not None:
+                self.is_running = True
+                self.status_label.config(text=f"正在启动程序监控... {self.target_process_name} (PID: {self.target_pid})")
+            elif self.monitor_mode == "path" and self.target_process_path is not None:
+                self.is_running = True
+                self.status_label.config(text=f"正在启动路径监控... {self.target_process_name}")
+            else:
+                if self.monitor_mode == "window":
+                    messagebox.showwarning("警告", "请先选择一个窗口并开始监控。")
+                elif self.monitor_mode == "process":
+                    messagebox.showwarning("警告", "请先选择一个程序并开始监控。")
+                else:  # path mode
+                    messagebox.showwarning("警告", "请先选择并验证程序路径。")
+                return
+            
             threading.Thread(target=self.monitor_window, daemon=True).start()
             if hasattr(self, 'btn_start'):
                 self.btn_start.config(state="disabled")
             if hasattr(self, 'btn_stop'):
                 self.btn_stop.config(state="normal")
         else:
-            messagebox.showwarning("警告", "请先选择一个窗口并开始监控。")
+            messagebox.showwarning("警告", "监控已在运行中。")
 
     def stop_monitoring(self):
         """停止监控"""
